@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.idea/
+.DS_Store
+
+# Datasets and outputs
+/datas/
+/outputs/
+/wandb/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
