@@ -243,6 +243,109 @@ def val_dit_one_batch(dit, vae, val_loader, device, save_path):
             
             break
 
+
+def save_diffink_svg(recon, seq_len, filename):
+    """Export [T,5] absolute coordinates using the existing PNG rules."""
+    import numpy as np
+    from pathlib import Path
+
+    if hasattr(recon, "detach"):
+        recon = recon.detach().cpu().numpy()
+    a = np.asarray(recon)
+    if a.ndim != 2 or a.shape[1] != 5:
+        raise ValueError("Expected recon with shape [T,5]")
+    if not 0 < seq_len <= len(a):
+        raise ValueError("Invalid sequence length")
+    a = a[:seq_len].copy()
+    if not np.isfinite(a).all():
+        raise ValueError("Non-finite values in recon")
+
+    filename = Path(filename)
+    np.save(str(filename.with_suffix(".npy")), a)
+
+    # Match plot_line_cv2_new: stop at the penultimate character end.
+    ends = np.flatnonzero(
+        (a[:, 2] == 0) & (a[:, 3] == 0) & (a[:, 4] == 1)
+    )
+    if len(ends) < 2:
+        print("SVG skipped: fewer than two character ends:", filename,
+              flush=True)
+        return
+
+    a = a[:int(ends[-2]) + 1]
+    x, y = a[:, 0], a[:, 1]
+    height, padding = 256, 20
+    scale = (height - 2 * padding) / (y.max() - y.min() + 1e-6)
+    points = np.column_stack((
+        (x - x.min()) * scale + padding,
+        (y.max() - y) * scale + padding,
+    ))
+    width = int(np.ceil((x.max() - x.min()) * scale)) + 2 * padding
+
+    # Use the PNG's integer pixel distances for the same rejection rule.
+    pixels = points.astype(np.int32)
+
+    # A4 layout in millimeters.
+    # Keep pixels unchanged for the original distance filter.
+    distances = np.linalg.norm(
+        np.diff(pixels.astype(np.float64), axis=0), axis=1
+    )
+    drawable = (a[:-1, 2] == 1) & (distances < 200)
+    used = np.zeros(len(points), dtype=bool)
+    used[:-1] |= drawable
+    used[1:] |= drawable
+
+    if not used.any():
+        print("SVG skipped: no drawable segments:", filename, flush=True)
+        return
+
+    points = points.astype(np.float64)
+    lower = points[used].min(axis=0)
+    span = points[used].max(axis=0) - lower
+
+    # Fit within 250 x 150 mm without distorting the handwriting.
+    limits = [
+        limit / size
+        for limit, size in zip((250.0, 150.0), span)
+        if size > 0
+    ]
+    fit = min(limits) if limits else 1.0
+    offset = np.array([
+        (297.0 - span[0] * fit) / 2.0,
+        30.0,
+    ])
+    points = (points - lower) * fit + offset
+    paths = []
+    active = None
+    for j in range(len(points) - 1):
+        distance = np.linalg.norm(
+            pixels[j].astype(np.float64) - pixels[j + 1]
+        )
+        if a[j, 2] != 1 or distance >= 200:
+            active = None
+            continue
+        if active is None:
+            active = [
+                "M {:.6f} {:.6f}".format(*points[j])
+            ]
+            paths.append(active)
+        active.append("L {:.6f} {:.6f}".format(*points[j + 1]))
+
+    svg = [
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape" '
+        'width="297mm" height="210mm" viewBox="0 0 297 210">',
+        '<g id="handwriting" inkscape:groupmode="layer" '
+        'inkscape:label="1-Handwriting" '
+        'fill="none" stroke="black" stroke-width="0.3" '
+        'stroke-linecap="round" stroke-linejoin="round">',
+    ]
+    svg.extend('<path d="{}"/>'.format(" ".join(p)) for p in paths)
+    svg.extend(["</g>", "</svg>"])
+    filename.write_text("\n".join(svg) + "\n", encoding="utf-8")
+    print("SVG saved:", filename, "strokes:", len(paths), flush=True)
+
+
 def infer_diffink(dit, vae, val_loader, device, save_path):
     dit.eval()
     vae.eval()
@@ -255,6 +358,10 @@ def infer_diffink(dit, vae, val_loader, device, save_path):
     )
 
     os.makedirs(save_path, exist_ok=True)
+    import tempfile
+    save_path = tempfile.mkdtemp(prefix='svg_test_', dir=save_path)
+    print('SVG test output:', save_path, flush=True)
+    saved_samples = 0
 
     with torch.no_grad():
         for p, batch in tqdm(enumerate(val_loader), desc="val", unit="batch"):
@@ -299,9 +406,16 @@ def infer_diffink(dit, vae, val_loader, device, save_path):
                 ]
 
                 # 生成样本
-                recon = sample_from_params(params, temp=0.1, max_seq_len=seq_len, greedy=True) # T 5
-                plot_line_cv2_new(data[i], save_path=f"{save_path}/gt_{p * batch_size + i}.png", canvas_height=256, padding=20, line_thickness=2, max_dist=200)
-                plot_line_cv2_new(recon, save_path=f"{save_path}/recon_{p * batch_size + i}.png", canvas_height=256, padding=20, line_thickness=2, max_dist=200)
-            
+                recon = sample_from_params(params, temp=0.1, max_seq_len=seq_len, greedy=True)  # T 5
+                plot_line_cv2_new(data[i], save_path=f"{save_path}/gt_{p * batch_size + i}.png", canvas_height=256,
+                                  padding=20, line_thickness=2, max_dist=200)
+                plot_line_cv2_new(recon, save_path=f"{save_path}/recon_{p * batch_size + i}.png", canvas_height=256,
+                                  padding=20, line_thickness=2, max_dist=200)
+                save_diffink_svg(recon, seq_len, f"{save_path}/recon_{p * batch_size + i}.svg")
+                saved_samples += 1
+                if saved_samples >= 3:
+                    print('SVG test finished: 3 samples', flush=True)
+                    return
+
             # break
 
