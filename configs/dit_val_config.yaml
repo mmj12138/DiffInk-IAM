@@ -47,7 +47,7 @@ dit_resume_ckpt: './outputs/ink_dit_tune_03_21_13_37/ckpt/dit_epoch_1.pt'
 
 # Training configuration
 train_batch_size: 64
-val_batch_size: 1000
+val_batch_size: 3
 num_epochs: 1000
 val_every: 50
 save_every: 50

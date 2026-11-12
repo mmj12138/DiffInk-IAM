@@ -34,7 +34,7 @@ text_file: ./datas/iam_validation/text.json
 writer_file: null
 output_base: ./outputs/iam_validation
 vae_model_path: ./outputs/ink_vae_03_14_02_12/ckpt/vae_epoch_100.pt
-dit_resume_ckpt: ./outputs/ink_vae_03_14_02_12/ckpt/dit_epoch_1-001.pt
+dit_resume_ckpt: ./outputs/ink_dit_tune_03_21_13_37/ckpt/dit_epoch_1.pt
 train_batch_size: 64
 val_batch_size: 1
 num_epochs: 1000
