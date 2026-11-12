@@ -8,7 +8,7 @@ import numpy as np
 import yaml
 
 
-def convert_line(data):
+def convert_line(data, *, reorder_by_character=False):
     points = data['points']
     segments = data['gt_segmentation']['segments']
     text = ''.join(s['substring'] for s in segments)
@@ -39,9 +39,11 @@ def convert_line(data):
         for ink in ranges:
             start = lookup[(ink['startStroke'], ink['startPoint'])]
             stop = lookup[(ink['endStroke'], ink['endPoint'])]
-            if stop < start or start <= last_source:
+            if stop < start or (not reorder_by_character and start <= last_source):
                 raise ValueError('Reversed, overlapping, or out-of-order inkRanges')
             for i in range(start, stop + 1):
+                if i in used:
+                    raise ValueError('Overlapping inkRanges reuse a point')
                 used.add(i)
                 connected = i < stop and points[i]['stroke'] == points[i + 1]['stroke']
                 rows.append([*xy[i], 1 if connected else 0, 0 if connected else 1, 0])
@@ -58,14 +60,14 @@ def convert_line(data):
     return np.asarray(rows, np.float32), np.asarray(ends, np.int64), text, writer, scale
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', required=True, type=Path, help='One JSON or a directory (recursive)')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--split', choices=['train', 'val', 'test'], default='test')
     parser.add_argument('--text-file', type=Path, help='Reuse a training vocabulary for val/test')
     parser.add_argument('--writer-file', type=Path, help='Reuse training writer metadata')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     paths = [args.input] if args.input.is_file() else sorted(args.input.rglob('*.json'))
     if not paths:
         parser.error('No JSON files found')
@@ -110,7 +112,7 @@ def main():
     (args.output / 'writers.json').write_text(json.dumps(writers, indent=2))
     manifest = {'split': args.split, 'lines': len(converted), 'train_length_eligible': sum(200 <= len(x[1][0]) <= 2000 for x in converted), 'sources': [x[2] for x in converted]}
     (args.output / 'manifest.json').write_text(json.dumps(manifest, indent=2))
-    config = yaml.safe_load(Path('configs/vae_config.yaml').read_text())
+    config = yaml.safe_load((Path(__file__).resolve().parents[1] / 'configs' / 'vae_config.yaml').read_text())
     config.update(train_file=str(h5_path.resolve()) if args.split == 'train' else None,
                   val_file=str(h5_path.resolve()) if args.split in ('val', 'test') else None,
                   text_file=str((args.output / 'text.json').resolve()),

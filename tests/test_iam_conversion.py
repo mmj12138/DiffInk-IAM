@@ -1,7 +1,7 @@
 import copy
 import unittest
 import numpy as np
-from scripts.convert_iam_json import convert_line
+from prepare.iam import convert_line
 
 
 class IAMConversionTest(unittest.TestCase):
@@ -30,6 +30,23 @@ class IAMConversionTest(unittest.TestCase):
         seq, ends, *_ = convert_line(data)
         np.testing.assert_array_equal(seq[2, 2:], [0, 1, 0])
         np.testing.assert_array_equal(ends, [6])
+
+    def test_character_reordering_preserves_points_and_boundaries(self):
+        data = copy.deepcopy(self.data)
+        data['gt_segmentation']['segments'][0]['inkRanges'], data['gt_segmentation']['segments'][2]['inkRanges'] = (
+            data['gt_segmentation']['segments'][2]['inkRanges'],
+            data['gt_segmentation']['segments'][0]['inkRanges'])
+        with self.assertRaisesRegex(ValueError, 'out-of-order'):
+            convert_line(data)
+        seq, ends, *_ = convert_line(data, reorder_by_character=True)
+        np.testing.assert_array_equal(ends, [3, 3, 6])
+        self.assertGreater(seq[0, 0], seq[3, 0])
+        np.testing.assert_array_equal(seq[[2, 5], 2:], [[0, 0, 1], [0, 0, 1]])
+
+    def test_reordering_still_rejects_reused_points(self):
+        self.data['gt_segmentation']['segments'][-1]['inkRanges'][0]['startStroke'] = 0
+        with self.assertRaisesRegex(ValueError, 'Overlapping'):
+            convert_line(self.data, reorder_by_character=True)
 
     def test_reject_uncovered_points(self):
         self.data['gt_segmentation']['segments'][-1]['inkRanges'][0]['endPoint'] = 1

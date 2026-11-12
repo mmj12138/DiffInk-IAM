@@ -44,6 +44,10 @@ Text-to-Online Handwriting Generation (TOHG) refers to the task of synthesizing 
 
 Download the dataset and pretrained weights from [Google Drive](https://drive.google.com/drive/folders/1h_uLmn-55WmbSBGh1ES8-rftAbDs8riB?usp=drive_link) or [Baidu Cloud](https://pan.baidu.com/s/1NhEoO_hIDOn2dC4qN1oe1A?pwd=ddra).
 
+### IAM preparation
+
+Prepare segmented IAM JSON with `python -m prepare.iam`; see [prepare/README.md](prepare/README.md) for input requirements and split commands.
+
 ### Training
 
 - Train the **InkVAE** model with: `bash scripts/train_vae_ddp.sh`
