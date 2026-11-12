@@ -361,7 +361,6 @@ def infer_diffink(dit, vae, val_loader, device, save_path):
     import tempfile
     save_path = tempfile.mkdtemp(prefix='svg_test_', dir=save_path)
     print('SVG test output:', save_path, flush=True)
-    saved_samples = 0
 
     with torch.no_grad():
         for p, batch in tqdm(enumerate(val_loader), desc="val", unit="batch"):
@@ -412,10 +411,6 @@ def infer_diffink(dit, vae, val_loader, device, save_path):
                 plot_line_cv2_new(recon, save_path=f"{save_path}/recon_{p * batch_size + i}.png", canvas_height=256,
                                   padding=20, line_thickness=2, max_dist=200)
                 save_diffink_svg(recon, seq_len, f"{save_path}/recon_{p * batch_size + i}.svg")
-                saved_samples += 1
-                if saved_samples >= 3:
-                    print('SVG test finished: 3 samples', flush=True)
-                    return
 
             # break
 

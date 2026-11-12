@@ -47,4 +47,3 @@ betas:
 - 0.99
 weight_decay: 0.0001
 val_num_workers: 0
-max_samples: null

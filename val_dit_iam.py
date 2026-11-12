@@ -12,7 +12,7 @@ from dataset.vae_dataset import ValDataset
 from torch.utils.data import DataLoader
 from utils.optim import dit_build_optimizer_and_scheduler
 from utils.utils import ModelConfig, save_checkpoint, load_config_from_yaml, set_seed
-from trainer.iam_inference import infer_diffink
+from trainer.dit_trainer import infer_diffink
 
 from model.dit import TextEmbedding, InputEmbedding, DiT
 
@@ -88,8 +88,7 @@ def val_diffink(config_path="./configs/dit_val_iam.yaml"):
 
     # 开始测试
     output_path = config_dict.get("output_base", './')
-    infer_diffink(dit, vae, val_loader, device, f'{output_path}/step_20_cfg_1',
-                  max_samples=config_dict.get('max_samples', 3))
+    infer_diffink(dit, vae, val_loader, device, f'{output_path}/step_20_cfg_1')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
