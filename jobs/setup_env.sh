@@ -1,15 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=diffink_test
-#SBATCH --partition=gpu
-#SBATCH --qos=job_gratis
-#SBATCH --gres=gpu:rtx4090:1
-#SBATCH --nodes=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=02:00:00
-#SBATCH --output=diffink_%j.out
-#SBATCH --error=diffink_%j.err
-
+# Source from a job script after setting DIFFINK_ROOT.
 module load Anaconda3/2022.05
 
 export PATH="/storage/homefs/mj24z011/.conda/envs/diffink/bin:$PATH"
@@ -31,7 +21,4 @@ which python
 echo "Checking environment:"
 python -c "import sys, torch, wandb; print(sys.executable); print(torch.__version__); print(wandb.__version__)"
 
-cd /storage/homefs/mj24z011/DiffInk-IAM
-
-python val_dit.py
-
+cd "$DIFFINK_ROOT"
