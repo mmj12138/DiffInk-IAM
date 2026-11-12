@@ -7,8 +7,10 @@ import h5py
 import numpy as np
 import yaml
 
+from .normalization import normalize_points
 
-def convert_line(data, *, reorder_by_character=False):
+
+def convert_line(data, *, reorder_by_character=False, normalization="point_y"):
     points = data['points']
     segments = data['gt_segmentation']['segments']
     text = ''.join(s['substring'] for s in segments)
@@ -19,15 +21,7 @@ def convert_line(data, *, reorder_by_character=False):
     lookup = {(p['stroke'], p['index']): i for i, p in enumerate(points)}
     if len(lookup) != len(points):
         raise ValueError('Duplicate stroke/point IDs')
-    xy = np.asarray([[p['x'], p['y']] for p in points], dtype=np.float64)
-    if not np.isfinite(xy).all():
-        raise ValueError('Non-finite coordinates')
-    # Absolute coordinates, isotropic scaling; IAM y points down, DiffInk y up.
-    scale = float(xy[:, 1].std())
-    if scale <= 0:
-        raise ValueError('Zero vertical extent')
-    xy = (xy - xy.mean(axis=0)) / scale
-    xy[:, 1] *= -1
+    xy, _, scale = normalize_points(points, mode=normalization)
     rows, ends, used = [], [], set()
     last_source = -1
     for segment in segments:

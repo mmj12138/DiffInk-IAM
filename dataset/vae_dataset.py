@@ -25,7 +25,10 @@ class TrainDataset(Dataset):
 
         for key in self.hf.keys():
             num_points = len(self.hf[key]['point_seq'])
-            if 2000>= num_points >= 200:
+            line_text = self.hf[key]['line_text'][()].decode('utf-8')
+            # Original point-count filter (temporarily disabled):
+            # if 2000 >= num_points >= 200:
+            if num_points <= 2000 and len(line_text) >= 2:
                 self.keys.append(key)
                 self.lengths.append(num_points)
 
@@ -178,7 +181,10 @@ class ValDataset(Dataset):
 
         for key in self.hf.keys():
             num_points = len(self.hf[key]['point_seq'])
-            if num_points >= 200:
+            line_text = self.hf[key]['line_text'][()].decode('utf-8')
+            # Original point-count filter (temporarily disabled):
+            # if num_points >= 200:
+            if len(line_text) >= 2:
                 self.keys.append(key)
                 self.lengths.append(num_points)
 

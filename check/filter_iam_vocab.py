@@ -16,7 +16,8 @@ def inspect_line(data, vocabulary):
     try:
         seq, _, _, _, _ = convert_line(data, reorder_by_character=True)
         result['conversion_error'] = None
-        result['validation_eligible'] = not missing and len(seq) >= 200
+        # Original length filter (temporarily disabled): len(seq) >= 200
+        result['validation_eligible'] = not missing and len(text) >= 2
     except (ValueError, KeyError, TypeError, IndexError) as exc:
         result['conversion_error'] = str(exc)
         result['validation_eligible'] = False
@@ -52,7 +53,7 @@ def main():
                'covered_and_validation_eligible': sum(r['validation_eligible'] for r in covered),
                'out_of_vocabulary_lines': len(rejected), 'read_or_schema_errors': len(errors)}
     report = {'summary':summary, 'vocabulary': str(args.vocab.resolve()),
-              'policy': 'Check text verbatim, including spaces/case/punctuation; validation requires successful conversion and at least 200 points. No characters removed.',
+              'policy': 'Check text verbatim, including spaces/case/punctuation; validation requires successful conversion and at least 2 text characters. No characters removed.',
               'missing_character_line_counts':dict(sorted(missing_counts.items())),
               'covered':covered, 'rejected':rejected, 'errors':errors}
     args.output.parent.mkdir(parents=True, exist_ok=True)

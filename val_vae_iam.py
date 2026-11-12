@@ -28,6 +28,7 @@ def decode_argmax(output, length):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,default=Path('configs/dit_val_iam.yaml'))
+    parser.add_argument('--checkpoint',type=Path,help='Override VAE checkpoint (e.g. IAM best.pt)')
     parser.add_argument('--output',type=Path,default=Path('outputs/iam_vae_check'))
     parser.add_argument('--max-samples',type=int,default=None)
     parser.add_argument('--device',choices=['cuda','cpu'],default='cuda')
@@ -41,7 +42,9 @@ def main():
     config['num_text_embedding']=len(vocab)+1
     torch.manual_seed(42);np.random.seed(42)
     model=VAE(ModelConfig(config))
-    ckpt=torch.load(config['vae_model_path'],map_location='cpu')
+    checkpoint=args.checkpoint or config.get('vae_model_path')
+    if not checkpoint:parser.error('Provide --checkpoint or vae_model_path in config')
+    ckpt=torch.load(str(checkpoint),map_location='cpu',weights_only=False)
     weights={k.removeprefix('module.'):v for k,v in ckpt['model_state_dict'].items()}
     required=('encoder.','conv_mu.','conv_logvar.','decoder.','transformer_decoder.')
     state=model.state_dict()
@@ -54,7 +57,8 @@ def main():
     rows=[]
     page=['<!doctype html><meta charset="utf-8"><title>VAE reconstruction</title><style>body{font-family:system-ui;margin:24px}svg{width:100%;max-width:1140px}article{border-bottom:1px solid #aaa}</style><h1>VAE-only reconstruction</h1><p>No DiT. Blue/orange use the exact GT prefix point index. All characters shown. All panels of a sample share coordinate bounds. mu_argmax isolates VAE reconstruction; z_argmax adds posterior noise; z_current also uses existing mixture sampling.</p>']
     with h5py.File(config['val_file']) as hf, torch.inference_mode():
-        keys=sorted((k for k in hf if len(hf[k]['point_seq'])>=200),key=lambda k:len(hf[k]['point_seq']),reverse=True)
+        # Original filter (temporarily disabled): len(hf[k]['point_seq']) >= 200
+        keys=sorted((k for k in hf if len(hf[k]['line_text'].asstr()[()]) >= 2),key=lambda k:len(hf[k]['point_seq']),reverse=True)
         if args.max_samples is not None:keys=keys[:args.max_samples]
         for index,key in enumerate(keys):
             g=hf[key];seq=g['point_seq'][:];n=len(seq)
