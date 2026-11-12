@@ -6,7 +6,7 @@
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=vae_iam_train_%j.out
 #SBATCH --error=vae_iam_train_%j.err
 
