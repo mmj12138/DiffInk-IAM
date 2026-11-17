@@ -226,7 +226,7 @@ class ValDataset(Dataset):
         return writer_id, point_seq, line_text, char_points_idx
 
     @staticmethod
-    def get_text_index(line_text):
+    def get_text_index(line_text, append_sentinel=True):
         font_data = ValDataset.text_cache
 
         char_idx = []
@@ -236,7 +236,8 @@ class ValDataset(Dataset):
                 if char not in font_data:
                     raise ValueError(f"未知字符: {char}")
                 converted.append(font_data[char])
-            converted.append(font_data['、']) # one more char
+            if append_sentinel:
+                converted.append(font_data['、']) # legacy extra validation character
             char_idx.append(converted)
 
         text_tensor = [torch.tensor(lst, dtype=torch.long) for lst in char_idx]
@@ -245,10 +246,10 @@ class ValDataset(Dataset):
         return padded_text
 
     @staticmethod
-    def collate_fn(batch):
+    def collate_fn(batch, append_sentinel=True):
         writer_id, sequences, line_text, char_points_idx = zip(*batch)
 
-        text_index = ValDataset.get_text_index(line_text)
+        text_index = ValDataset.get_text_index(line_text, append_sentinel=append_sentinel)
 
         max_length = max([seq.shape[0] for seq in sequences])
         min_length = min([seq.shape[0] for seq in sequences])

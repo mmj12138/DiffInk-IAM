@@ -10,12 +10,12 @@ import h5py
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
 
-from dataset.iam_training_dataset import IAMTrainingDataset, collate_original_vae
+from dataset import build_datasets_and_loaders_ddp
 from model.vae import VAE
-from utils.utils import ModelConfig
+from utils.utils import ModelConfig, load_config_from_yaml, set_seed
 from utils.optim import dit_build_optimizer_and_scheduler
+from trainer.vae_trainer import train_vae_one_epoch, val_vae_one_epoch, val_vae_one_batch
 
 TRAINING_IMPL = "vae_trainer_ctc_exact_v1"
 
@@ -27,18 +27,23 @@ def dataset_signature(config):
     return digest.hexdigest()
 
 
-def load_data(config):
-    train=IAMTrainingDataset(config['train_file'],config['text_file'],config['writer_file'],True)
-    val=IAMTrainingDataset(config['val_file'],config['text_file'],config['writer_file'],False)
-    writers=json.loads(Path(config['writer_file']).read_text())
-    for a,b in [('train','val'),('train','test'),('val','test')]:
-        if set(writers[a])&set(writers[b]):raise ValueError('Writer split overlap')
-    with h5py.File(config['train_file']) as a,h5py.File(config['val_file']) as b:
-        aw={g['writer_id'].asstr()[()] for g in a.values()};bw={g['writer_id'].asstr()[()] for g in b.values()}
-        if aw&bw or not aw<=set(writers['train']) or not bw<=set(writers['val']):raise ValueError('H5 writer leakage')
-    config['num_text_embedding']=len(train.vocab)+1
-    config['num_writer']=len(train.writers)
-    return train,val
+def load_data(config_dict):
+    """Check author isolation and use the original dataset/loader builder."""
+    writers = json.loads(Path(config_dict['writer_file']).read_text())
+    for left, right in [('train', 'val'), ('train', 'test'), ('val', 'test')]:
+        if set(writers[left]) & set(writers[right]):
+            raise ValueError('Writer split overlap')
+    with h5py.File(config_dict['train_file']) as train, h5py.File(config_dict['val_file']) as val:
+        train_writers = {group['writer_id'].asstr()[()] for group in train.values()}
+        val_writers = {group['writer_id'].asstr()[()] for group in val.values()}
+        if (train_writers & val_writers or not train_writers <= set(writers['train'])
+                or not val_writers <= set(writers['val'])):
+            raise ValueError('H5 writer leakage')
+    # Preserve the current IAM data conditions when reusing the original builder.
+    return build_datasets_and_loaders_ddp(
+        config_dict, ddp=False, augment=False, append_val_sentinel=False
+    )
+
 
 
 def save_checkpoint(path,model,optimizer,scheduler,epoch,best,config,signature,stale):
@@ -66,76 +71,98 @@ def report_ctc_compatibility(config):
         print(f'{split}: CTC eligible={exact}/{total}; CTC skipped={total-exact}; previous conservative check={eligible}/{total}',flush=True)
 
 
-def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',type=Path,default=Path('configs/vae_iam_scratch.yaml'))
-    parser.add_argument('--resume',type=Path,help='Resume ONLY a checkpoint from this IAM training entry')
-    parser.add_argument('--check-data',action='store_true',help='Check data and a batch without constructing a model')
-    args=parser.parse_args()
-    config=yaml.safe_load(args.config.read_text())
-    train,val=load_data(config)
-    signature=dataset_signature(config)
-    report_ctc_compatibility(config)
-    print(f'Train={len(train)} val={len(val)} writer classes={config["num_writer"]} text classes={config["num_text_embedding"]}',flush=True)
-    if args.check_data:
-        for name,dataset in [('train',train),('val',val)]:
-            batch=collate_original_vae([dataset[i] for i in range(min(2,len(dataset)))])
-            print(name,'data',list(batch[0].shape),'labels',list(batch[2].shape),'format=original trainer tuple',flush=True)
-            dataset.close()
-        return
-    if not torch.cuda.is_available():raise RuntimeError('Training requires a UBELIX CUDA GPU job')
-    from trainer.vae_trainer import train_vae_one_epoch, val_vae_one_epoch, val_vae_one_batch
+def train_vae(config_path, resume=None):
+    """Single-GPU entry, organized like train_vae_ddp.train_vae."""
+    # === Set device (one logical GPU in the current Slurm job) ===
+    if not torch.cuda.is_available():
+        raise RuntimeError('Training requires a CUDA GPU job')
+    local_rank = 0
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
 
-    random.seed(config['seed']);np.random.seed(config['seed']);torch.manual_seed(config['seed'])
-    device=torch.device('cuda')
-    train_loader=DataLoader(train,batch_size=config['train_batch_size'],shuffle=True,num_workers=config['num_workers'],collate_fn=collate_original_vae)
-    val_loader=DataLoader(val,batch_size=config['val_batch_size'],shuffle=False,num_workers=config['num_workers'],collate_fn=collate_original_vae)
-    # No pretrained checkpoint is loaded on the scratch path.
-    model=VAE(ModelConfig(config)).to(device)
-    config['warmup_steps']=max(1,int(len(train_loader)*config['num_epochs']*config.get('warmup_fraction',.05)))
-    optimizer,scheduler=dit_build_optimizer_and_scheduler(model,config,len(train_loader))
-    model_config=ModelConfig(config)
+    # === Load config and datasets ===
+    config_dict = load_config_from_yaml(config_path)
+    train_loader, val_loader, config_dict = load_data(config_dict)
+    config = ModelConfig(config_dict)
+    signature = dataset_signature(config_dict)
+    report_ctc_compatibility(config_dict)
+
+    # === Initialize, using the same seed helper as the DDP entry ===
+    set_seed(config_dict.get('seed', 42))
+    vae = VAE(config).to(device)
+
+    # === Optimizer and scheduler ===
+    config_dict['warmup_steps'] = max(1, int(
+        len(train_loader) * config_dict['num_epochs'] * config_dict.get('warmup_fraction', .05)
+    ))
+    optimizer, scheduler = dit_build_optimizer_and_scheduler(
+        vae, config_dict, len(train_loader)
+    )
+
+    # === Restore checkpoint, or create a fresh run ===
     start=0;best=float('inf');stale=0
-    if args.resume:
-        ckpt=torch.load(str(args.resume),map_location='cpu',weights_only=False)
+    if resume:
+        ckpt=torch.load(str(resume),map_location='cpu',weights_only=False)
         if ckpt.get('training_impl') != TRAINING_IMPL:
             raise ValueError('This checkpoint used a different trainer; start a new baseline run instead of resuming the old custom-loss run')
-        if ckpt.get('dataset_signature')!=signature or ckpt.get('config')!=config:
+        if ckpt.get('dataset_signature')!=signature or ckpt.get('config')!=config_dict:
             raise ValueError('Resume dataset/config mismatch; use the original run config and prepared data')
-        model.load_state_dict(ckpt['model_state_dict'],strict=True)
+        vae.load_state_dict(ckpt['model_state_dict'],strict=True)
         optimizer.load_state_dict(ckpt['optimizer_state_dict']);scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         start=ckpt['epoch'];best=ckpt['best_val_reconstruction'];stale=ckpt.get('stale_epochs',0)
         torch.set_rng_state(ckpt['torch_rng']);torch.cuda.set_rng_state_all(ckpt['cuda_rng'])
         np.random.set_state(ckpt['numpy_rng']);random.setstate(ckpt['python_rng'])
-        output=args.resume.resolve().parent.parent
+        output=resume.resolve().parent.parent
     else:
-        base=Path(config['output_base']);base.mkdir(parents=True,exist_ok=True)
+        base=Path(config_dict['output_base']);base.mkdir(parents=True,exist_ok=True)
         output=Path(tempfile.mkdtemp(prefix='run_',dir=base))
     (output/'ckpt').mkdir(exist_ok=True)
-    (output/'config.yaml').write_text(yaml.safe_dump(config,sort_keys=False))
+    (output/'config.yaml').write_text(yaml.safe_dump(config_dict,sort_keys=False))
     print(f'Output: {output}',flush=True)
-    for epoch in range(start,config['num_epochs']):
-        print(f'Epoch {epoch+1}/{config["num_epochs"]}',flush=True)
-        training=train_vae_one_epoch(model,model_config,train_loader,optimizer,scheduler,
-                                     epoch,config['num_epochs'],device,ddp=False)
+    for epoch in range(start,config_dict['num_epochs']):
+        print(f'Epoch {epoch+1}/{config_dict["num_epochs"]}',flush=True)
+        training=train_vae_one_epoch(vae,config,train_loader,optimizer,scheduler,
+                                     epoch,config_dict['num_epochs'],device,ddp=False)
         if not training['updated_batches']:
             raise FloatingPointError('Original trainer skipped all updates in this epoch')
-        validation=val_vae_one_epoch(model,model_config,val_loader,device)
+        validation=val_vae_one_epoch(vae,config,val_loader,device)
         improved=validation['reconstruction']<best
         if improved:best=validation['reconstruction'];stale=0
         else:stale+=1
         record={'epoch':epoch+1,'train':training,'val':validation,'lr':optimizer.param_groups[0]['lr']}
         with (output/'history.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
         print(json.dumps(record),flush=True)
-        save_checkpoint(output/'ckpt/latest.pt',model,optimizer,scheduler,epoch+1,best,config,signature,stale)
-        if improved:save_checkpoint(output/'ckpt/best.pt',model,optimizer,scheduler,epoch+1,best,config,signature,stale)
-        if epoch==0 or (epoch+1)%config['preview_every']==0:
+        save_checkpoint(output/'ckpt/latest.pt',vae,optimizer,scheduler,epoch+1,best,config_dict,signature,stale)
+        if improved:save_checkpoint(output/'ckpt/best.pt',vae,optimizer,scheduler,epoch+1,best,config_dict,signature,stale)
+        if epoch==0 or (epoch+1)%config_dict['preview_every']==0:
             # Diagnostics must not consume the RNG state saved for resuming training.
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-                val_vae_one_batch(model,val_loader,epoch,device,str(output/f'preview_epoch_{epoch+1:03d}'))
-        if stale>=config['patience']:
+                val_vae_one_batch(vae,val_loader,epoch,device,str(output/f'preview_epoch_{epoch+1:03d}'))
+        if stale>=config_dict['patience']:
             print(f'Early stopping after {stale} epochs without validation reconstruction improvement',flush=True);break
-    train.close();val.close()
+    train_loader.dataset.hf.close()
+    val_loader.dataset.hf.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=Path('configs/vae_iam_scratch.yaml'))
+    parser.add_argument('--resume', type=Path, help='Resume a checkpoint from this IAM training entry')
+    parser.add_argument('--check-data', action='store_true', help='Check data without creating a model')
+    args = parser.parse_args()
+
+    if args.check_data:
+        config_dict = load_config_from_yaml(args.config)
+        train_loader, val_loader, config_dict = load_data(config_dict)
+        report_ctc_compatibility(config_dict)
+        for name, loader in [('train', train_loader), ('val', val_loader)]:
+            batch = next(iter(loader))
+            print(name, 'samples', len(loader.dataset), 'data', list(batch[0].shape),
+                  'labels', list(batch[2].shape), flush=True)
+            loader.dataset.hf.close()
+        return
+
+    train_vae(args.config, resume=args.resume)
 
 
 if __name__=='__main__':main()

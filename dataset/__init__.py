@@ -1,3 +1,4 @@
+from functools import partial
 from .vae_dataset import TrainDataset, ValDataset
 from .transform import Transform
 from torch.utils.data import DataLoader, DistributedSampler
@@ -34,9 +35,9 @@ def build_test_datasets_and_loaders(config):
 
     return val_loader, config
 
-def build_datasets_and_loaders_ddp(config, ddp=False):
-    transform = Transform(data_fixed_length=config.get("data_fixed_length", 1000),
-                          prob=config.get("aug_prob", 0.5))
+def build_datasets_and_loaders_ddp(config, ddp=False, augment=True, append_val_sentinel=True):
+    transform = (Transform(data_fixed_length=config.get("data_fixed_length", 1000),
+                           prob=config.get("aug_prob", 0.5)) if augment else None)
 
     train_dataset = TrainDataset(config["train_file"], text_file=config["text_file"], writer_file=config["writer_file"], transform=transform)
     val_dataset = ValDataset(config["val_file"], text_file=config["text_file"], writer_file=None, transform=None)
@@ -55,9 +56,9 @@ def build_datasets_and_loaders_ddp(config, ddp=False):
         shuffle = True
 
     train_loader = DataLoader(train_dataset, batch_size=train_batch_size, sampler=train_sampler,
-                              shuffle=shuffle, num_workers=8, collate_fn=TrainDataset.collate_fn)
+                              shuffle=shuffle, num_workers=config.get("num_workers", 8), collate_fn=TrainDataset.collate_fn)
 
-    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=8,
-                            collate_fn=ValDataset.collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, num_workers=config.get("num_workers", 8),
+                            collate_fn=partial(ValDataset.collate_fn, append_sentinel=append_val_sentinel))
 
     return train_loader, val_loader, config
