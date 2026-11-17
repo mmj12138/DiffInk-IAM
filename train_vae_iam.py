@@ -1,9 +1,7 @@
-"""Single-GPU IAM VAE training from scratch, with joint OCR/style learning."""
+"""Single-GPU IAM entry using the original trainer.vae_trainer implementation."""
 import argparse
 import hashlib
-import html
 import json
-import math
 import random
 import tempfile
 from pathlib import Path
@@ -14,10 +12,12 @@ import torch
 import yaml
 from torch.utils.data import DataLoader
 
-from dataset.iam_training_dataset import IAMTrainingDataset, collate_iam
+from dataset.iam_training_dataset import IAMTrainingDataset, collate_original_vae
 from model.vae import VAE
-from trainer.iam_vae import compute_losses
 from utils.utils import ModelConfig
+from utils.optim import dit_build_optimizer_and_scheduler
+
+TRAINING_IMPL = "vae_trainer_ctc_exact_v1"
 
 
 def dataset_signature(config):
@@ -41,62 +41,29 @@ def load_data(config):
     return train,val
 
 
-def run_epoch(model,loader,config,device,optimizer=None,scheduler=None):
-    training=optimizer is not None
-    model.train(training)
-    totals={};samples=0
-    for index,batch in enumerate(loader):
-        for key in ['data','mask','labels','writers']:batch[key]=batch[key].to(device)
-        if training:optimizer.zero_grad(set_to_none=True)
-        with torch.set_grad_enabled(training):
-            loss,metrics=compute_losses(model,batch,config,training)
-            if not torch.isfinite(loss):raise FloatingPointError(f'Non-finite loss in {batch["keys"]}')
-            if training:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(),config['grad_clip'],error_if_nonfinite=True)
-                optimizer.step();scheduler.step()
-        count=len(batch['keys']);samples+=count
-        for key,value in metrics.items():
-            value=float(value.detach()) if torch.is_tensor(value) else value
-            totals[key]=totals.get(key,0)+value*(1 if key.startswith('ctc_') and key.endswith('_samples') else count)
-        if training and (index+1)%config['log_every']==0:
-            print(f'  step {index+1}/{len(loader)} loss={float(loss):.5f} lr={optimizer.param_groups[0]["lr"]:.3g}',flush=True)
-    return {k:v if k.endswith('_samples') else v/samples for k,v in totals.items()}
-
-
 def save_checkpoint(path,model,optimizer,scheduler,epoch,best,config,signature,stale):
     payload={'model_state_dict':model.state_dict(),'optimizer_state_dict':optimizer.state_dict(),
              'scheduler_state_dict':scheduler.state_dict(),'epoch':epoch,'best_val_reconstruction':best,
              'config':config,'dataset_signature':signature,'stale_epochs':stale,
+             'training_impl':TRAINING_IMPL,
              'torch_rng':torch.get_rng_state(),'cuda_rng':torch.cuda.get_rng_state_all(),
              'numpy_rng':np.random.get_state(),'python_rng':random.getstate()}
     temporary=path.with_suffix('.tmp')
     torch.save(payload,temporary);temporary.replace(path)
 
 
-def save_preview(model,config,device,destination):
-    from check.iam_prefix import prefix_info,trajectory_svg
-    from val_vae_iam import decode_argmax
-    destination.mkdir(parents=True,exist_ok=True)
-    page=['<!doctype html><meta charset="utf-8"><title>IAM VAE validation</title><style>svg{width:100%;max-width:1140px}</style><h1>Unseen-writer validation: GT / deterministic reconstruction</h1>']
-    model.eval()
-    with h5py.File(config['val_file']) as hf,torch.inference_mode():
-        keys=[k for k in hf if len(hf[k]['line_text'].asstr()[()])>=2][:3]
-        for key in keys:
-            g=hf[key];seq=g['point_seq'][:];n=len(seq)
-            info=prefix_info(seq,g['char_points_idx'][:],g['line_text'].asstr()[()])
-            padded=((n+7)//8)*8
-            data=torch.tensor([0,0,0,0,1],dtype=torch.float32).repeat(padded,1)
-            data[:n]=torch.from_numpy(seq)
-            _,mu,_=model.encode(data.T.unsqueeze(0).to(device))
-            recon=decode_argmax(model.decode(mu),n)
-            bounds=(np.minimum(seq[:,:2].min(0),recon[:,:2].min(0)),np.maximum(seq[:,:2].max(0),recon[:,:2].max(0)))
-            page.append(f'<h2>{html.escape(key)}: {html.escape(info["text"])}</h2>')
-            for name,curve in [('gt',seq),('recon',recon)]:
-                svg=trajectory_svg(curve,info['prefix_end_exclusive'],bounds=bounds)
-                (destination/f'{key}_{name}.svg').write_text(svg)
-                page.append(f'<h3>{name}</h3>'+svg)
-    (destination/'index.html').write_text('\n'.join(page))
+def report_ctc_compatibility(config):
+    for split in ('train','val'):
+        total=eligible=exact=0
+        with h5py.File(config[f'{split}_file']) as hf:
+            for group in hf.values():
+                text=group['line_text'].asstr()[()];points=len(group['point_seq'])
+                if len(text)<2 or (split=='train' and points>2000):continue
+                length=(points+7)//8
+                total+=1
+                eligible+=length>=2*len(text)-1
+                exact+=length>=len(text)+sum(a==b for a,b in zip(text,text[1:]))
+        print(f'{split}: CTC eligible={exact}/{total}; CTC skipped={total-exact}; previous conservative check={eligible}/{total}',flush=True)
 
 
 def main():
@@ -108,31 +75,31 @@ def main():
     config=yaml.safe_load(args.config.read_text())
     train,val=load_data(config)
     signature=dataset_signature(config)
+    report_ctc_compatibility(config)
     print(f'Train={len(train)} val={len(val)} writer classes={config["num_writer"]} text classes={config["num_text_embedding"]}',flush=True)
     if args.check_data:
         for name,dataset in [('train',train),('val',val)]:
-            batch=collate_iam([dataset[i] for i in range(min(2,len(dataset)))])
-            print(name,'data',list(batch['data'].shape),'labels',list(batch['labels'].shape),flush=True)
+            batch=collate_original_vae([dataset[i] for i in range(min(2,len(dataset)))])
+            print(name,'data',list(batch[0].shape),'labels',list(batch[2].shape),'format=original trainer tuple',flush=True)
             dataset.close()
         return
     if not torch.cuda.is_available():raise RuntimeError('Training requires a UBELIX CUDA GPU job')
+    from trainer.vae_trainer import train_vae_one_epoch, val_vae_one_epoch, val_vae_one_batch
+
     random.seed(config['seed']);np.random.seed(config['seed']);torch.manual_seed(config['seed'])
     device=torch.device('cuda')
-    train_loader=DataLoader(train,batch_size=config['train_batch_size'],shuffle=True,num_workers=config['num_workers'],collate_fn=collate_iam)
-    val_loader=DataLoader(val,batch_size=config['val_batch_size'],shuffle=False,num_workers=config['num_workers'],collate_fn=collate_iam)
+    train_loader=DataLoader(train,batch_size=config['train_batch_size'],shuffle=True,num_workers=config['num_workers'],collate_fn=collate_original_vae)
+    val_loader=DataLoader(val,batch_size=config['val_batch_size'],shuffle=False,num_workers=config['num_workers'],collate_fn=collate_original_vae)
     # No pretrained checkpoint is loaded on the scratch path.
     model=VAE(ModelConfig(config)).to(device)
-    optimizer=torch.optim.AdamW(model.parameters(),lr=config['base_lr'],betas=tuple(config['betas']),weight_decay=config['weight_decay'])
-    steps=len(train_loader)*config['num_epochs'];warmup=max(1,int(steps*config['warmup_fraction']))
-    def schedule(step):
-        if step<warmup:return (step+1)/warmup
-        progress=min(1.,(step-warmup)/max(1,steps-warmup))
-        floor=config['min_lr']/config['base_lr']
-        return floor+(1-floor)*.5*(1+math.cos(math.pi*progress))
-    scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer,schedule)
+    config['warmup_steps']=max(1,int(len(train_loader)*config['num_epochs']*config.get('warmup_fraction',.05)))
+    optimizer,scheduler=dit_build_optimizer_and_scheduler(model,config,len(train_loader))
+    model_config=ModelConfig(config)
     start=0;best=float('inf');stale=0
     if args.resume:
         ckpt=torch.load(str(args.resume),map_location='cpu',weights_only=False)
+        if ckpt.get('training_impl') != TRAINING_IMPL:
+            raise ValueError('This checkpoint used a different trainer; start a new baseline run instead of resuming the old custom-loss run')
         if ckpt.get('dataset_signature')!=signature or ckpt.get('config')!=config:
             raise ValueError('Resume dataset/config mismatch; use the original run config and prepared data')
         model.load_state_dict(ckpt['model_state_dict'],strict=True)
@@ -149,8 +116,11 @@ def main():
     print(f'Output: {output}',flush=True)
     for epoch in range(start,config['num_epochs']):
         print(f'Epoch {epoch+1}/{config["num_epochs"]}',flush=True)
-        training=run_epoch(model,train_loader,config,device,optimizer,scheduler)
-        validation=run_epoch(model,val_loader,config,device)
+        training=train_vae_one_epoch(model,model_config,train_loader,optimizer,scheduler,
+                                     epoch,config['num_epochs'],device,ddp=False)
+        if not training['updated_batches']:
+            raise FloatingPointError('Original trainer skipped all updates in this epoch')
+        validation=val_vae_one_epoch(model,model_config,val_loader,device)
         improved=validation['reconstruction']<best
         if improved:best=validation['reconstruction'];stale=0
         else:stale+=1
@@ -162,7 +132,7 @@ def main():
         if epoch==0 or (epoch+1)%config['preview_every']==0:
             # Diagnostics must not consume the RNG state saved for resuming training.
             with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-                save_preview(model,config,device,output/f'preview_epoch_{epoch+1:03d}')
+                val_vae_one_batch(model,val_loader,epoch,device,str(output/f'preview_epoch_{epoch+1:03d}'))
         if stale>=config['patience']:
             print(f'Early stopping after {stale} epochs without validation reconstruction improvement',flush=True);break
     train.close();val.close()

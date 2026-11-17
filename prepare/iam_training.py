@@ -95,13 +95,16 @@ def check_record(seq, ends, text):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, default=Path('datas/iam'))
-    parser.add_argument('--output', type=Path, default=Path('datas/iam_train_rdp005'))
+    parser.add_argument('--output', type=Path)
+    parser.add_argument('--no-rdp', action='store_true', help='Disable simplification and keep every original trajectory point')
     parser.add_argument('--normalization', choices=['arc_y','point_y'], default='arc_y')
     parser.add_argument('--epsilon', type=float, default=0.05)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--test-writers', type=int, default=25)
     parser.add_argument('--val-writers', type=int, default=20)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = Path('datas/iam_train_no_rdp' if args.no_rdp else 'datas/iam_train_rdp005')
     if args.output.exists():
         raise FileExistsError(f'Choose a new output directory: {args.output}')
     if not np.isfinite(args.epsilon) or args.epsilon < 0:
@@ -123,7 +126,10 @@ def main():
             continue
         try:
             seq,ends,text,writer,scale = convert_line(data,reorder_by_character=True,normalization=args.normalization)
-            reduced,new_ends,kept = simplify_line(seq,ends,args.epsilon)
+            if args.no_rdp:
+                reduced,new_ends,kept = seq,ends.astype(np.int32),np.arange(len(seq),dtype=np.int64)
+            else:
+                reduced,new_ends,kept = simplify_line(seq,ends,args.epsilon)
             check_record(reduced,new_ends,text)
         except Exception as exc:
             raise ValueError(f'{path}: {exc}') from exc
@@ -150,9 +156,11 @@ def main():
     for split in writers:
         with h5py.File(args.output/f'{split}.h5','w') as hf:
             hf.attrs['normalization'] = normalization_description
-            hf.attrs['rdp_epsilon'] = args.epsilon
+            hf.attrs['rdp_enabled'] = not args.no_rdp
+            if not args.no_rdp:
+                hf.attrs['rdp_epsilon'] = args.epsilon
             hf.attrs['rdp_units'] = 'normalized coordinate units'
-            hf.attrs['rdp_scope'] = 'each continuous stroke piece; character/range endpoints forced'
+            hf.attrs['rdp_scope'] = 'disabled; all points retained' if args.no_rdp else 'each continuous stroke piece; character/range endpoints forced'
             hf.attrs['point_order'] = 'character order; original order within ranges; source JSON split ignored'
             hf.attrs['split'] = split
             for r in records:
@@ -202,11 +210,11 @@ def main():
     if any(actual_writers[a]&actual_writers[b] for a,b in [('train','val'),('train','test'),('val','test')]):
         raise ValueError('Writer leakage')
     summary = {'input_lines':len(paths),'accepted_lines':len(records),'excluded_lines':len(excluded),
-               'excluded':excluded,'seed':args.seed,'rdp_epsilon':args.epsilon,'normalization':normalization_description,
+               'excluded':excluded,'seed':args.seed,'rdp_enabled':not args.no_rdp,'rdp_epsilon':None if args.no_rdp else args.epsilon,'normalization':normalization_description,
                'normalization_mode':args.normalization,
                'paper_source':'https://arxiv.org/html/2509.23624#A1',
                'reproduction_limits':['Arc-length weighted y scaling is our explicit line-level adaptation; cited single-character formula uses x scaling.',
-                                      'RDP keeps character/range endpoints in addition to stroke endpoints; epsilon 0.05 selected by visual inspection, differing from the paper value 0.5.',
+                                      ('RDP disabled for comparison; every point retained.' if args.no_rdp else f'RDP keeps character/range endpoints in addition to stroke endpoints; epsilon {args.epsilon} differs from paper value 0.5.'),
                                       '20 validation writers are our additional selection; paper only specifies 25 test writers.'],
                'vocabulary_size':len(vocabulary),'vocabulary_fit':'training text only; Unicode sorted; values equal key-order IDs; includes legacy validation sentinel 、',
                'num_text_embedding':len(vocabulary)+1,'oov':oov,'splits':stats,

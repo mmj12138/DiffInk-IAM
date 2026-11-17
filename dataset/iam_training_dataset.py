@@ -36,6 +36,7 @@ class IAMTrainingDataset(Dataset):
         return {'key':key,'text':text,'writer_id':writer,
                 'writer_label':self.writers[writer] if self.training else -1,
                 'points':torch.from_numpy(g['point_seq'][:]),
+                'char_points_idx':g['char_points_idx'][:],
                 'labels':torch.tensor([self.vocab[c] for c in text],dtype=torch.long)}
 
     def __getstate__(self):
@@ -54,3 +55,10 @@ def collate_iam(batch):
     return {'data':data,'mask':mask,'labels':pad_sequence([b['labels'] for b in batch],batch_first=True,padding_value=-1),
             'writers':torch.tensor([b['writer_label'] for b in batch]),
             'keys':[b['key'] for b in batch],'texts':[b['text'] for b in batch]}
+
+
+def collate_original_vae(batch):
+    """Adapt IAM data to the tuple expected by the original vae_trainer."""
+    packed=collate_iam(batch)
+    return (packed['data'], packed['mask'], packed['labels'],
+            [sample['char_points_idx'] for sample in batch], packed['writers'])

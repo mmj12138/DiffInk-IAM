@@ -22,7 +22,7 @@ train_file: ./datas/iam_train_rdp005/train.h5
 val_file: ./datas/iam_train_rdp005/val.h5
 text_file: ./datas/iam_train_rdp005/text.json
 writer_file: ./datas/iam_train_rdp005/writers.json
-output_base: ./outputs/iam_vae_scratch
+output_base: ./outputs/iam_vae_original
 kl_weight: 1.0e-07
 gmm_weight: 0.1
 pen_weight: 1.0
@@ -40,9 +40,7 @@ weight_decay: 0.0001
 splits_file: ./datas/iam_train_rdp005/splits.json
 report_file: ./datas/iam_train_rdp005/report.json
 warmup_fraction: 0.05
-grad_clip: 5.0
 num_workers: 0
 seed: 42
 preview_every: 5
 patience: 20
-log_every: 20

@@ -121,7 +121,12 @@ class VAE(nn.Module):
         target_lengths = (labels != -100).sum(dim=1).to(torch.long)
 
         # 过滤合法样本（CTC 要求 input_len >= 2 * target_len - 1 且 target_len > 0）
-        valid_mask = (target_lengths > 0) & (input_lengths >= (2 * target_lengths - 1))
+        # valid_mask = (target_lengths > 0) & (input_lengths >= (2 * target_lengths - 1))
+
+        # CTC needs a blank only between adjacent repeated target characters.
+        # Previous conservative check: input_lengths >= 2 * target_lengths - 1.
+        repeats = ((labels[:, 1:] == labels[:, :-1]) & (labels[:, 1:] > 0)).sum(dim=1)
+        valid_mask = (target_lengths > 0) & (input_lengths >= target_lengths + repeats)
 
         if valid_mask.any():
             input_lengths = input_lengths[valid_mask]

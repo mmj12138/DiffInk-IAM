@@ -16,10 +16,10 @@ set -euo pipefail
 export DIFFINK_ROOT="${DIFFINK_ROOT:-/storage/homefs/mj24z011/DiffInk-IAM}"
 source "$DIFFINK_ROOT/jobs/setup_env.sh"
 
-# Default: inspect 3 samples. Set MAX_SAMPLES=all to process all 87.
-if [ "${MAX_SAMPLES:-3}" = "all" ]; then
-    python -u val_vae_iam.py --config configs/dit_val_iam.yaml
-else
-    python -u val_vae_iam.py --config configs/dit_val_iam.yaml --max-samples "${MAX_SAMPLES:-3}"
-fi
-
+# Default preview: 3 samples. Use MAX_SAMPLES=all for full-set metrics.
+args=(--config "${CONFIG:-configs/dit_val_iam.yaml}")
+if [ -n "${CHECKPOINT:-}" ]; then args+=(--checkpoint "$CHECKPOINT"); fi
+if [ -n "${DATA_FILE:-}" ]; then args+=(--input "$DATA_FILE"); fi
+if [ "${MAX_SAMPLES:-3}" != "all" ]; then args+=(--max-samples "${MAX_SAMPLES:-3}"); fi
+if [ "${METRICS_ONLY:-0}" = "1" ]; then args+=(--metrics-only); fi
+python -u val_vae_iam.py "${args[@]}"

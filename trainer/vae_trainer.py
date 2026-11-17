@@ -24,6 +24,9 @@ def train_vae_one_epoch(vae, config, train_loader, optimizer, scheduler, epoch, 
     get_ctc_loss = ctc_weight != 0
     get_style_loss = style_weight != 0
 
+    # Reporting only: retain the original forward, losses and update steps.
+    epoch_metrics = {name: 0.0 for name in ('total', 'reconstruction', 'gmm', 'pen', 'kl', 'ctc', 'style')}
+    sample_count = ctc_valid_count = ctc_invalid_count = updated_batches = skipped_batches = 0
     steps_per_epoch = len(train_loader)
     for i, batch in tqdm(enumerate(train_loader), desc=f"Epoch {epoch + 1}", unit="batch"):
         global_step = epoch * steps_per_epoch + i + 1
@@ -70,6 +73,7 @@ def train_vae_one_epoch(vae, config, train_loader, optimizer, scheduler, epoch, 
             skip_step = (not torch.isfinite(total_loss).item())
 
         if skip_step:
+            skipped_batches += 1
             if (not ddp) or torch.distributed.get_rank() == 0:
                 def safe_item(x):
                     try:
@@ -105,6 +109,19 @@ def train_vae_one_epoch(vae, config, train_loader, optimizer, scheduler, epoch, 
         optimizer.step()
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
+        batch_size = data.size(0)
+        values = dict(total=total_loss, reconstruction=gmm_loss*gmm_weight+ce_loss*pen_weight,
+                      gmm=gmm_loss, pen=ce_loss, kl=kl_loss, ctc=ctc_loss, style=style_loss)
+        for name, value in values.items():
+            epoch_metrics[name] += float(value.detach()) * batch_size
+        sample_count += batch_size
+        updated_batches += 1
+        if get_ctc_loss:
+            target_lengths = (text_idx >= 0).sum(1)
+            repeats = ((text_idx[:,1:] == text_idx[:,:-1]) & (text_idx[:,1:] >= 0)).sum(1)
+            eligible = (target_lengths > 0) & (pad_mask.sum(1) >= target_lengths+repeats)
+            ctc_valid_count += int(eligible.sum())
+            ctc_invalid_count += batch_size-int(eligible.sum())
             
         if ddp:
             total_loss = reduce_loss(total_loss)
@@ -148,6 +165,51 @@ def train_vae_one_epoch(vae, config, train_loader, optimizer, scheduler, epoch, 
         del output
         del pad_mask
         del data, mask, text_idx, writer_id, char_points_idx, batch
+
+    result = {name: value/max(sample_count, 1) for name, value in epoch_metrics.items()}
+    result.update(ctc_valid_samples=ctc_valid_count, ctc_invalid_samples=ctc_invalid_count,
+                  updated_batches=updated_batches, skipped_batches=skipped_batches)
+    return result
+
+
+@torch.no_grad()
+def val_vae_one_epoch(model, config, val_loader, device):
+    """Full validation using the same original VAE/GMM losses; no writer loss for unseen authors."""
+    model.eval()
+    totals = {name: 0.0 for name in ('total', 'reconstruction', 'gmm', 'pen', 'kl', 'ctc', 'style')}
+    samples = valid_count = invalid_count = 0
+    for data, mask, labels, _, _ in tqdm(val_loader, desc='validation', unit='batch'):
+        data, mask, labels = data.to(device), mask.to(device), labels.to(device)
+        pad_mask = downsample_mask(mask, compression_factor=8)
+        data = data.permute(0, 2, 1)
+        output, ctc, kl, _ = model(data, pad_mask, labels, None,
+                                   get_ctc_loss=config.ctc_weight != 0, get_style_loss=False)
+        pi, mx, my, sx, sy, corr, pen, logits = get_mixture_coef_max(output, num_mixture=20)
+        loss_d, loss_c = get_loss(pi, mx, my, sx, sy, corr, pen, logits,
+                                  data[:, :1], data[:, 1:2], data[:, 2:])
+        gmm = (loss_d*mask).sum()/mask.sum()
+        reconstruction = gmm*config.gmm_weight+loss_c*config.pen_weight
+        total = reconstruction+kl.mean()*config.kl_weight+ctc.mean()*config.ctc_weight
+        if not torch.isfinite(total):
+            raise FloatingPointError('Non-finite original VAE validation loss')
+        values = dict(total=total, reconstruction=reconstruction, gmm=gmm, pen=loss_c,
+                      kl=kl.mean(), ctc=ctc.mean(), style=total.new_zeros(()))
+        size = data.size(0)
+        for name, value in values.items():
+            totals[name] += float(value)*size
+        samples += size
+        if config.ctc_weight != 0:
+            lengths = (labels >= 0).sum(1)
+            repeats = ((labels[:,1:] == labels[:,:-1]) & (labels[:,1:] >= 0)).sum(1)
+            eligible = (lengths > 0) & (pad_mask.sum(1) >= lengths+repeats)
+            valid_count += int(eligible.sum())
+            invalid_count += size-int(eligible.sum())
+    if not samples:
+        raise ValueError('Empty validation loader')
+    result = {name: value/samples for name, value in totals.items()}
+    result.update(ctc_valid_samples=valid_count, ctc_invalid_samples=invalid_count)
+    return result
+
 
 def val_vae_one_batch(model, val_loader, epoch, device, save_path):
     model.eval()
