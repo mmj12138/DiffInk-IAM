@@ -125,7 +125,8 @@ def main():
     checkpoint=args.checkpoint or config.get('vae_model_path')
     if not checkpoint:parser.error('Provide --checkpoint or vae_model_path in config')
     ckpt=torch.load(str(checkpoint),map_location='cpu',weights_only=False)
-    weights={k.removeprefix('module.'):v for k,v in ckpt['model_state_dict'].items()}
+    weights={(k[len('module.'):] if k.startswith('module.') else k):v
+             for k,v in ckpt['model_state_dict'].items()}
     state=model.state_dict()
     def available(prefix):
         keys=[key for key in state if key.startswith(prefix)]
