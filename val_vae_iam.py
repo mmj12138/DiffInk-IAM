@@ -89,15 +89,37 @@ def recognize_latent(model, mu, mask, characters, length, resolution='points'):
     return ctc_greedy(ids,characters)
 
 
-def summarize(rows):
-    text=[r['text_evaluation'] for r in rows if r['text_evaluation'] is not None]
-    errors={key:sum(r[key] for r in text) for key in ['character_errors','reference_characters','word_errors','reference_words']}
+def ctc_eligibility(text, points, resolution):
+    available=(points+7)//8 if resolution=='latent' else points
+    required=len(text)+sum(a==b for a,b in zip(text,text[1:]))
+    return {'ctc_eligible':bool(text) and available>=required,
+            'ctc_input_steps':available,'ctc_minimum_steps':required}
+
+
+def summarize(rows, ocr_resolution='latent'):
+    decoded=[]
+    for row in rows:
+        result=row['text_evaluation']
+        if result is not None:
+            result.update(ctc_eligibility(row['text'],row['points'],ocr_resolution))
+            decoded.append(result)
+    eligible=[result for result in decoded if result['ctc_eligible']]
+    def aggregate(results):
+        counts={key:sum(result[key] for result in results)
+                for key in ['character_errors','reference_characters','word_errors','reference_words']}
+        return {'cer':counts['character_errors']/counts['reference_characters'] if counts['reference_characters'] else None,
+                'wer':counts['word_errors']/counts['reference_words'] if counts['reference_words'] else None,**counts}
+    primary=aggregate(eligible)
+    all_samples=aggregate(decoded)
     classified=[r['writer_evaluation'] for r in rows if r['writer_evaluation']['correct'] is not None]
-    return {'samples':len(rows),'ocr_evaluated_samples':len(text),
+    return {'samples':len(rows),'ocr_decoded_samples':len(decoded),'ocr_evaluated_samples':len(eligible),
+            'ctc_ineligible_ocr_samples':len(decoded)-len(eligible),
+            'ctc_eligible_fraction':len(eligible)/len(decoded) if decoded else None,
             'dtw_mean_normalized':float(np.mean([r['metrics']['mu_argmax']['dtw']['normalized'] for r in rows])),
-            'latent_ocr_cer':errors['character_errors']/errors['reference_characters'] if errors['reference_characters'] else None,
-            'latent_ocr_wer':errors['word_errors']/errors['reference_words'] if errors['reference_words'] else None,
-            **errors,'writer_classification_accuracy':sum(r['correct'] for r in classified)/len(classified) if classified else None,
+            'latent_ocr_cer':primary['cer'],'latent_ocr_wer':primary['wer'],
+            **{key:value for key,value in primary.items() if key not in ('cer','wer')},
+            'all_samples_ocr':all_samples,
+            'writer_classification_accuracy':sum(r['correct'] for r in classified)/len(classified) if classified else None,
             'writer_evaluated_samples':len(classified),
             'unknown_writer_samples':sum(r['writer_evaluation']['status']=='unseen_writer' for r in rows)}
 
@@ -143,7 +165,7 @@ def main():
     args.output.mkdir(parents=True,exist_ok=True)
     out=Path(tempfile.mkdtemp(prefix='vae_',dir=args.output))
     rows=[]
-    page=['<!doctype html><meta charset="utf-8"><title>VAE evaluation</title><style>body{font-family:system-ui;margin:24px}svg{width:100%;max-width:1140px}article{border-bottom:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>VAE evaluation</h1><p>DTW evaluates deterministic mu/argmax reconstruction in the GT normalized XY coordinates. CER/WER evaluate OCR on the original trajectory latent, not an independent recognizer of reconstruction. Writer accuracy is only defined for training writers. Case and punctuation are preserved; CER includes spaces and WER splits on whitespace.</p>']
+    page=['<!doctype html><meta charset="utf-8"><title>VAE evaluation</title><style>body{font-family:system-ui;margin:24px}svg{width:100%;max-width:1140px}article{border-bottom:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>VAE evaluation</h1><p>DTW evaluates deterministic mu/argmax reconstruction in the GT normalized XY coordinates. CER/WER evaluate OCR on the original trajectory latent, not an independent recognizer of reconstruction. Writer accuracy is only defined for training writers. Primary CER/WER include only CTC-eligible samples; all_samples_ocr retains the full-set rates. Case and punctuation are preserved; CER includes spaces and WER splits on whitespace.</p>']
     with h5py.File(data_file) as hf,torch.inference_mode():
         # Original 200-point filter remains disabled.
         keys=sorted((key for key in hf if len(hf[key]['line_text'].asstr()[()])>=2),key=lambda key:len(hf[key]['point_seq']),reverse=True)
@@ -165,7 +187,8 @@ def main():
             info['text_evaluation']=None
             if ocr_available:
                 prediction=recognize_latent(model,mu,mask,characters,n,resolution=ocr_resolution)
-                info['text_evaluation']={'prediction':prediction,**text_errors(text,prediction)}
+                info['text_evaluation']={'prediction':prediction,**text_errors(text,prediction),
+                                         **ctc_eligibility(text,n,ocr_resolution)}
             info['writer_evaluation']={'status':'unseen_writer','correct':None,'prediction':None}
             if writer in writer_labels:
                 if style_available:
@@ -197,11 +220,12 @@ def main():
             page.append('<pre>'+html.escape(json.dumps(details,ensure_ascii=False,indent=2))+'</pre></article>')
             rows.append(info)
             print(f'{index+1}/{len(keys)} {key} DTW={info["metrics"]["mu_argmax"]["dtw"]["normalized"]:.5f}',flush=True)
-    summary=summarize(rows)
+    summary=summarize(rows,ocr_resolution=ocr_resolution)
     metadata={'checkpoint':str(checkpoint),'input':str(data_file),'ocr_head_loaded':ocr_available,
               'style_head_loaded':style_available,'ocr_time_resolution':ocr_resolution,'decode':'posterior mean mu; highest-weight mixture mean per point',
               'dtw':'XY Euclidean minimum-total-cost path, divided by path length; no separate curve rescaling',
-              'text':'latent OCR; greedy CTC; original case/punctuation; CER includes spaces; WER whitespace tokenization',
+              'text':'latent OCR; greedy CTC; primary CER/WER only on CTC-eligible samples; original case/punctuation; CER includes spaces; WER whitespace tokenization',
+              'ocr_metric_scope':'all_samples_ocr separately reports every decoded sample, including CTC-ineligible cases',
               'writer':'accuracy over known training writers only; null if no eligible writers'}
     (out/'report.json').write_text(json.dumps({'summary':summary,'evaluation':metadata,'samples':rows},ensure_ascii=False,indent=2))
     page.insert(1,'<h2>Summary</h2><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>')
