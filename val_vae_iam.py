@@ -13,9 +13,41 @@ import yaml
 
 from check.iam_prefix import prefix_info, trajectory_svg
 from model.vae import VAE
-from model.gmm import get_mixture_coef, sample_from_params
+from model.gmm import get_mixture_coef, get_mixture_coef_max, torch_2d_normal, sample_from_params
 from utils.utils import ModelConfig
 from utils.mask import downsample_mask
+
+
+def diagnose_gmm(output, seq):
+    """Compare the original PDF-floor loss gradient with log-space NLL at fixed outputs."""
+    with torch.inference_mode(False), torch.enable_grad():
+        raw=output.detach().clone().requires_grad_(True)
+        target=torch.tensor(seq[:,:2].T.copy(),device=raw.device).unsqueeze(0)
+        n=target.shape[-1]
+        pi,mx,my,sx,sy,rho,_,_=get_mixture_coef_max(raw[:,:,:n],20)
+        dx=(target[:,0:1]-mx)/sx;dy=(target[:,1:2]-my)/sy
+        one_minus=(1-rho.square()).clamp_min(1e-8)
+        log_pdf=-(dx.square()+dy.square()-2*rho*dx*dy)/(2*one_minus)
+        log_pdf=log_pdf-np.log(2*np.pi)-sx.log()-sy.log()-.5*one_minus.log()
+        log_density=torch.logsumexp(F.log_softmax(raw[:,3:23,:n],dim=1)+log_pdf,dim=1)
+        density=(pi*torch_2d_normal(target[:,0:1],target[:,1:2],mx,my,sx,sy,rho)).sum(1)
+        old=-torch.log(density+1e-8)
+        old_grad=torch.autograd.grad(old.sum(),raw,retain_graph=True)[0][:,23:63,:n].abs().sum(1)[0]
+        stable_grad=torch.autograd.grad((-log_density).sum(),raw)[0][:,23:63,:n].abs().sum(1)[0]
+        far=target[0,0].abs()>34
+        result={'gt_x_min':float(target[0,0].min()),'gt_x_max':float(target[0,0].max()),
+                'all_component_x_min':float(mx.min()),'all_component_x_max':float(mx.max()),
+                'scope':'mu reconstruction; gradients w.r.t. all component XY means; per-point NLL, no parameter updates'}
+        for label,selected in [('all',torch.ones_like(far)),('abs_gt_x_gt_34',far),('abs_gt_x_le_34',~far)]:
+            count=int(selected.sum());entry={'points':count}
+            if count:
+                entry.update(pdf_below_floor_fraction=float((log_density[0,selected]<np.log(1e-8)).float().mean()),
+                             log_density_mean=float(log_density[0,selected].mean()),
+                             original_nll_mean=float(old[0,selected].mean()),
+                             original_xy_gradient_mean=float(old_grad[selected].mean()),
+                             logspace_xy_gradient_mean=float(stable_grad[selected].mean()))
+            result[label]=entry
+        return result
 
 
 def decode_argmax(output, length):
@@ -131,6 +163,7 @@ def main():
     parser.add_argument('--input',type=Path,help='Override val_file, e.g. train.h5 for known-writer accuracy')
     parser.add_argument('--output',type=Path,default=Path('outputs/iam_vae_check'))
     parser.add_argument('--max-samples',type=int,default=None)
+    parser.add_argument('--diagnose-gmm',action='store_true',help='Report original vs log-space coordinate gradients at fixed mu reconstruction outputs')
     parser.add_argument('--sample-keys',nargs='+',help='Exact H5 sample keys, e.g. n01-023z-05.xml; preserves requested order')
     parser.add_argument('--metrics-only',action='store_true',help='Only deterministic evaluation; skip SVG/NPY and stochastic reconstructions')
     parser.add_argument('--device',choices=['cuda','cpu'],default='cuda')
@@ -189,6 +222,9 @@ def main():
             mask=(torch.arange(padded,device=args.device)<n).unsqueeze(0)
             z,mu,_=model.encode(x)
             mu_output=model.decode(mu)
+            if args.diagnose_gmm:
+                info['gmm_diagnostics']=diagnose_gmm(mu_output,seq)
+                print(json.dumps({'key':key,'gmm_diagnostics':info['gmm_diagnostics']}),flush=True)
             curves={'gt':seq,'mu_argmax':decode_argmax(mu_output,n)}
             info['text_evaluation']=None
             if ocr_available:

@@ -30,4 +30,5 @@ else
 fi
 if [ "$sample_limit" != "all" ]; then args+=(--max-samples "$sample_limit"); fi
 if [ "${METRICS_ONLY:-0}" = "1" ]; then args+=(--metrics-only); fi
+if [ "${DIAGNOSE_GMM:-0}" = "1" ]; then args+=(--diagnose-gmm); fi
 python -u val_vae_iam.py "${args[@]}"
