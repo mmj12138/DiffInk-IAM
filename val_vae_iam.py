@@ -131,6 +131,7 @@ def main():
     parser.add_argument('--input',type=Path,help='Override val_file, e.g. train.h5 for known-writer accuracy')
     parser.add_argument('--output',type=Path,default=Path('outputs/iam_vae_check'))
     parser.add_argument('--max-samples',type=int,default=None)
+    parser.add_argument('--sample-keys',nargs='+',help='Exact H5 sample keys, e.g. n01-023z-05.xml; preserves requested order')
     parser.add_argument('--metrics-only',action='store_true',help='Only deterministic evaluation; skip SVG/NPY and stochastic reconstructions')
     parser.add_argument('--device',choices=['cuda','cpu'],default='cuda')
     args=parser.parse_args()
@@ -169,6 +170,11 @@ def main():
     with h5py.File(data_file) as hf,torch.inference_mode():
         # Original 200-point filter remains disabled.
         keys=sorted((key for key in hf if len(hf[key]['line_text'].asstr()[()])>=2),key=lambda key:len(hf[key]['point_seq']),reverse=True)
+        if args.sample_keys:
+            requested=list(dict.fromkeys(args.sample_keys))
+            invalid=[key for key in requested if key not in keys]
+            if invalid:raise ValueError('Requested samples missing or ineligible in {}: {}'.format(data_file, ', '.join(invalid)))
+            keys=requested
         if args.max_samples is not None:keys=keys[:args.max_samples]
         if not keys:raise ValueError('No eligible samples')
         for index,key in enumerate(keys):
