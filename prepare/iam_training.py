@@ -99,10 +99,14 @@ def main():
     parser.add_argument('--no-rdp', action='store_true', help='Disable simplification and keep every original trajectory point')
     parser.add_argument('--normalization', choices=['arc_y','point_y'], default='arc_y')
     parser.add_argument('--epsilon', type=float, default=0.05)
+    parser.add_argument('--coordinate-multiplier',type=float,default=1.0,help='Fixed isotropic XY multiplier after normalization/simplification')
+    parser.add_argument('--write-splits',nargs='+',choices=['train','val','test'],default=['train','val','test'])
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--test-writers', type=int, default=25)
     parser.add_argument('--val-writers', type=int, default=20)
     args = parser.parse_args()
+    if not np.isfinite(args.coordinate_multiplier) or args.coordinate_multiplier<=0:
+        parser.error('--coordinate-multiplier must be finite and positive')
     if args.output is None:
         args.output = Path('datas/iam_train_no_rdp' if args.no_rdp else 'datas/iam_train_rdp005')
     if args.output.exists():
@@ -152,9 +156,12 @@ def main():
     oov = {split:sorted(set(''.join(r['text'] for r in records if r['split']==split))-vocabulary.keys()) for split in ['val','test']}
     if any(oov.values()):
         raise ValueError(f'Held-out characters not covered by training vocabulary: {oov}; no outputs written')
+    for record in records:
+        record['seq'][:,:2]*=args.coordinate_multiplier
     args.output.mkdir(parents=True)
-    for split in writers:
+    for split in args.write_splits:
         with h5py.File(args.output/f'{split}.h5','w') as hf:
+            hf.attrs['coordinate_multiplier']=args.coordinate_multiplier
             hf.attrs['normalization'] = normalization_description
             hf.attrs['rdp_enabled'] = not args.no_rdp
             if not args.no_rdp:
@@ -197,7 +204,7 @@ def main():
         item['ctc_feasible_at_point_resolution'] = sum(r['points'] >= required(r) for r in subset)
     # Verify actual saved HDF5 files, not only in-memory data.
     actual_writers = {}
-    for split in writers:
+    for split in args.write_splits:
         with h5py.File(args.output/f'{split}.h5','r') as hf:
             if len(hf)!=stats[split]['lines']: raise ValueError('Written count mismatch')
             actual_writers[split]=set()
@@ -207,11 +214,12 @@ def main():
                 writer=g['writer_id'].asstr()[()]
                 if writer not in writers[split] or set(text)-vocabulary.keys(): raise ValueError('Invalid split/vocabulary')
                 actual_writers[split].add(writer)
-    if any(actual_writers[a]&actual_writers[b] for a,b in [('train','val'),('train','test'),('val','test')]):
+    if any(actual_writers[a]&actual_writers[b] for a,b in [('train','val'),('train','test'),('val','test')] if a in actual_writers and b in actual_writers):
         raise ValueError('Writer leakage')
     summary = {'input_lines':len(paths),'accepted_lines':len(records),'excluded_lines':len(excluded),
                'excluded':excluded,'seed':args.seed,'rdp_enabled':not args.no_rdp,'rdp_epsilon':None if args.no_rdp else args.epsilon,'normalization':normalization_description,
                'normalization_mode':args.normalization,
+               'coordinate_multiplier':args.coordinate_multiplier,'written_splits':args.write_splits,
                'paper_source':'https://arxiv.org/html/2509.23624#A1',
                'reproduction_limits':['Arc-length weighted y scaling is our explicit line-level adaptation; cited single-character formula uses x scaling.',
                                       ('RDP disabled for comparison; every point retained.' if args.no_rdp else f'RDP keeps character/range endpoints in addition to stroke endpoints; epsilon {args.epsilon} differs from paper value 0.5.'),

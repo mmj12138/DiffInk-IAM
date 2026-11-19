@@ -61,6 +61,9 @@ def report_ctc_compatibility(config):
     for split in ('train','val'):
         total=eligible=exact=0
         with h5py.File(config[f'{split}_file']) as hf:
+            multiplier=float(hf.attrs.get('coordinate_multiplier',1.0))
+            if not np.isclose(multiplier,float(config.get('coordinate_multiplier',1.0))):
+                raise ValueError(f'{split}: data/config coordinate multiplier mismatch')
             for group in hf.values():
                 text=group['line_text'].asstr()[()];points=len(group['point_seq'])
                 if len(text)<2 or (split=='train' and points>2000):continue

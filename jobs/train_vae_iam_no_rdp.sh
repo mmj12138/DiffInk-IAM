@@ -17,10 +17,11 @@ export DIFFINK_ROOT="${DIFFINK_ROOT:-/storage/homefs/mj24z011/DiffInk-IAM}"
 source "$DIFFINK_ROOT/jobs/setup_env.sh"
 
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
+config="${CONFIG:-configs/vae_iam_no_rdp.yaml}"
 
 # No RESUME: initialize all VAE/OCR/style parameters from scratch.
 if [ -n "${RESUME:-}" ]; then
-    python -u train_vae_iam.py --config configs/vae_iam_no_rdp.yaml --resume "$RESUME"
+    python -u train_vae_iam.py --config "$config" --resume "$RESUME"
 else
-    python -u train_vae_iam.py --config configs/vae_iam_no_rdp.yaml
+    python -u train_vae_iam.py --config "$config"
 fi

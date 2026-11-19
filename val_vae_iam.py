@@ -251,6 +251,12 @@ def main():
     rows=[]
     page=['<!doctype html><meta charset="utf-8"><title>VAE evaluation</title><style>body{font-family:system-ui;margin:24px}svg{width:100%;max-width:1140px}article{border-bottom:1px solid #aaa}pre{white-space:pre-wrap}</style><h1>VAE evaluation</h1><p>DTW evaluates deterministic mu/argmax reconstruction in the GT normalized XY coordinates. CER/WER evaluate OCR on the original trajectory latent, not an independent recognizer of reconstruction. Writer accuracy is only defined for training writers. Primary CER/WER include only CTC-eligible samples; all_samples_ocr retains the full-set rates. Case and punctuation are preserved; CER includes spaces and WER splits on whitespace.</p>']
     with h5py.File(data_file) as hf,torch.inference_mode():
+        coordinate_multiplier=float(hf.attrs.get('coordinate_multiplier',1.0))
+        if not np.isfinite(coordinate_multiplier) or coordinate_multiplier<=0:
+            raise ValueError('Invalid H5 coordinate_multiplier')
+        trained_multiplier=float(ckpt.get('config',{}).get('coordinate_multiplier',1.0))
+        if not np.isclose(coordinate_multiplier,trained_multiplier):
+            raise ValueError('Checkpoint/data coordinate multiplier mismatch')
         # Original 200-point filter remains disabled.
         keys=sorted((key for key in hf if len(hf[key]['line_text'].asstr()[()])>=2),key=lambda key:len(hf[key]['point_seq']),reverse=True)
         if args.sample_keys:
@@ -276,7 +282,6 @@ def main():
                 info['gmm_diagnostics']=diagnose_gmm(mu_output,seq)
                 print(json.dumps({'key':key,'gmm_diagnostics':info['gmm_diagnostics']}),flush=True)
             curves={'gt':seq,'mu_argmax':decode_argmax(mu_output,n)}
-            info['coordinate_errors']=coordinate_errors(seq,curves['mu_argmax'],group['char_points_idx'][:])
             info['text_evaluation']=None
             if ocr_available:
                 prediction=recognize_latent(model,mu,mask,characters,n,resolution=ocr_resolution)
@@ -295,6 +300,10 @@ def main():
                 params=get_mixture_coef(z_output,num_mixture=20)[:7]
                 curves['z_current']=sample_from_params([p[0].cpu() for p in params],temp=.1,max_seq_len=n,greedy=True)[:n]
             info['metrics']={}
+            # Model inputs stay scaled; geometry metrics and exports use the original normalized units.
+            for curve in curves.values():curve[:,:2]/=coordinate_multiplier
+            seq=curves['gt']
+            info['coordinate_errors']=coordinate_errors(seq,curves['mu_argmax'],group['char_points_idx'][:])
             boundary=info['prefix_end_exclusive']
             page.append(f'<article><h2>{index}: {html.escape(key)} — {html.escape(text)}</h2>')
             for name,curve in curves.items():
@@ -333,6 +342,8 @@ def main():
               'ocr_metric_scope':'all_samples_ocr separately reports every decoded sample, including CTC-ineligible cases',
               'writer':'accuracy over known training writers only; null if no eligible writers'}
     metadata['coordinate_errors']='Same-index absolute XY errors, no alignment/rescaling; X bins use absolute GT X; text thirds use character endpoints; pooled MAE weighted by points'
+    metadata['coordinate_multiplier']=coordinate_multiplier
+    metadata['geometry_units']='Original normalized XY units; fixed coordinate multiplier inverted before metrics/exports; GMM diagnostics remain in model units'
     if output_bounds is not None:metadata['output_bounds']=output_bounds
     (out/'report.json').write_text(json.dumps({'summary':summary,'evaluation':metadata,'coordinate_errors_by_writer':writer_coordinates,'samples':rows},ensure_ascii=False,indent=2))
     page.insert(1,'<h2>Summary</h2><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>')
