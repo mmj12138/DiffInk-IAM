@@ -50,6 +50,27 @@ def diagnose_gmm(output, seq):
         return result
 
 
+def coordinate_errors(gt, predicted, char_ends):
+    """Pointwise errors in GT coordinates, grouped by X range and text position."""
+    error=np.abs(predicted[:,:2]-gt[:,:2])
+    x=np.abs(gt[:,0]);positions=np.arange(len(gt))
+    masks={'x_middle_le_34':x<=34,'x_ends_gt_34':x>34}
+    for low,high in [(0,10),(10,20),(20,30),(30,34),(34,40),(40,50),(50,70),(70,float('inf'))]:
+        masks['abs_x_{}_{}'.format(low,high)]=(x>=low)&(x<high)
+    # Whole characters stay together; empty character ranges add no points.
+    cuts=[0]+[int(char_ends[max(0,round(len(char_ends)*fraction)-1)]) for fraction in (1/3,2/3)]+[len(gt)]
+    for label,start,end in zip(('text_first_third','text_middle_third','text_last_third'),cuts[:-1],cuts[1:]):
+        masks[label]=(positions>=start)&(positions<end)
+    result={}
+    for label,mask in masks.items():
+        selected=error[mask];count=len(selected)
+        result[label]={'points':count,'x_abs_error_sum':float(selected[:,0].sum()),
+                       'y_abs_error_sum':float(selected[:,1].sum()),
+                       'x_mae':float(selected[:,0].mean()) if count else None,
+                       'y_mae':float(selected[:,1].mean()) if count else None}
+    return result
+
+
 def decode_argmax(output, length):
     pi, x, y, _, _, _, pen, _ = get_mixture_coef(output, num_mixture=20)
     index = pi[0,:,:length].argmax(dim=0,keepdim=True)
@@ -226,6 +247,7 @@ def main():
                 info['gmm_diagnostics']=diagnose_gmm(mu_output,seq)
                 print(json.dumps({'key':key,'gmm_diagnostics':info['gmm_diagnostics']}),flush=True)
             curves={'gt':seq,'mu_argmax':decode_argmax(mu_output,n)}
+            info['coordinate_errors']=coordinate_errors(seq,curves['mu_argmax'],group['char_points_idx'][:])
             info['text_evaluation']=None
             if ocr_available:
                 prediction=recognize_latent(model,mu,mask,characters,n,resolution=ocr_resolution)
@@ -263,13 +285,26 @@ def main():
             rows.append(info)
             print(f'{index+1}/{len(keys)} {key} DTW={info["metrics"]["mu_argmax"]["dtw"]["normalized"]:.5f}',flush=True)
     summary=summarize(rows,ocr_resolution=ocr_resolution)
+    def pooled_coordinates(selected):
+        result={}
+        for label in rows[0]['coordinate_errors']:
+            entries=[row['coordinate_errors'][label] for row in selected]
+            count=sum(entry['points'] for entry in entries)
+            result[label]={'points':count,
+                          'x_mae':sum(entry['x_abs_error_sum'] for entry in entries)/count if count else None,
+                          'y_mae':sum(entry['y_abs_error_sum'] for entry in entries)/count if count else None}
+        return result
+    summary['coordinate_errors_point_weighted']=pooled_coordinates(rows)
+    writer_coordinates={writer:pooled_coordinates([row for row in rows if row['writer_id']==writer])
+                        for writer in sorted({row['writer_id'] for row in rows})}
     metadata={'checkpoint':str(checkpoint),'input':str(data_file),'ocr_head_loaded':ocr_available,
               'style_head_loaded':style_available,'ocr_time_resolution':ocr_resolution,'decode':'posterior mean mu; highest-weight mixture mean per point',
               'dtw':'XY Euclidean minimum-total-cost path, divided by path length; no separate curve rescaling',
               'text':'latent OCR; greedy CTC; primary CER/WER only on CTC-eligible samples; original case/punctuation; CER includes spaces; WER whitespace tokenization',
               'ocr_metric_scope':'all_samples_ocr separately reports every decoded sample, including CTC-ineligible cases',
               'writer':'accuracy over known training writers only; null if no eligible writers'}
-    (out/'report.json').write_text(json.dumps({'summary':summary,'evaluation':metadata,'samples':rows},ensure_ascii=False,indent=2))
+    metadata['coordinate_errors']='Same-index absolute XY errors, no alignment/rescaling; X bins use absolute GT X; text thirds use character endpoints; pooled MAE weighted by points'
+    (out/'report.json').write_text(json.dumps({'summary':summary,'evaluation':metadata,'coordinate_errors_by_writer':writer_coordinates,'samples':rows},ensure_ascii=False,indent=2))
     page.insert(1,'<h2>Summary</h2><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>')
     (out/'index.html').write_text('\n'.join(page))
     print(json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
