@@ -18,6 +18,27 @@ from utils.utils import ModelConfig
 from utils.mask import downsample_mask
 
 
+def diagnose_output_bounds(model):
+    """Cauchy-Schwarz bounds for the final post-LayerNorm linear head."""
+    head=model.transformer_decoder
+    layer=head.transformer.layers[-1]
+    if layer.norm_first or head.transformer.norm is not None:
+        return {'status':'unsupported normalization layout'}
+    norm=layer.norm2;fc=head.fc
+    with torch.no_grad():
+        weight=fc.weight.detach().double()
+        gamma=norm.weight.detach().double() if norm.weight is not None else torch.ones_like(weight[0])
+        beta=norm.bias.detach().double() if norm.bias is not None else torch.zeros_like(weight[0])
+        center=weight@beta
+        if fc.bias is not None:center=center+fc.bias.detach().double()
+        effective=weight*gamma
+        effective=effective-effective.mean(dim=1,keepdim=True)
+        radius=weight.shape[1]**.5*effective.norm(dim=1)
+        return {'status':'valid outer bounds for current weights, not a fixed architecture limit',
+                'x_components':[{'component':i,'lower':float(center[23+i]-radius[23+i]),
+                                 'upper':float(center[23+i]+radius[23+i])} for i in range(20)]}
+
+
 def diagnose_gmm(output, seq):
     """Compare the original PDF-floor loss gradient with log-space NLL at fixed outputs."""
     with torch.inference_mode(False), torch.enable_grad():
@@ -35,6 +56,9 @@ def diagnose_gmm(output, seq):
         old_grad=torch.autograd.grad(old.sum(),raw,retain_graph=True)[0][:,23:63,:n].abs().sum(1)[0]
         stable_grad=torch.autograd.grad((-log_density).sum(),raw)[0][:,23:63,:n].abs().sum(1)[0]
         far=target[0,0].abs()>34
+        chosen=pi.argmax(dim=1,keepdim=True)
+        chosen_sx=sx.gather(1,chosen)[0,0]
+        chosen_sy=sy.gather(1,chosen)[0,0]
         result={'gt_x_min':float(target[0,0].min()),'gt_x_max':float(target[0,0].max()),
                 'all_component_x_min':float(mx.min()),'all_component_x_max':float(mx.max()),
                 'scope':'mu reconstruction; gradients w.r.t. all component XY means; per-point NLL, no parameter updates'}
@@ -45,7 +69,10 @@ def diagnose_gmm(output, seq):
                              log_density_mean=float(log_density[0,selected].mean()),
                              original_nll_mean=float(old[0,selected].mean()),
                              original_xy_gradient_mean=float(old_grad[selected].mean()),
-                             logspace_xy_gradient_mean=float(stable_grad[selected].mean()))
+                             logspace_xy_gradient_mean=float(stable_grad[selected].mean()),
+                             selected_sigma_x_mean=float(chosen_sx[selected].mean()),
+                             selected_sigma_y_mean=float(chosen_sy[selected].mean()),
+                             mixture_weighted_sigma_x_mean=float((pi*sx).sum(1)[0,selected].mean()))
             result[label]=entry
         return result
 
@@ -216,6 +243,8 @@ def main():
     style_available=available('style_classifier.') and len(writer_ids)==config['num_writer']
     model.load_state_dict({key:value for key,value in weights.items() if key in state and state[key].shape==value.shape},strict=False)
     model=model.to(args.device).eval()
+    output_bounds=diagnose_output_bounds(model) if args.diagnose_gmm else None
+    if output_bounds is not None:print(json.dumps({'output_bounds':output_bounds}),flush=True)
     data_file=args.input or Path(config['val_file'])
     args.output.mkdir(parents=True,exist_ok=True)
     out=Path(tempfile.mkdtemp(prefix='vae_',dir=args.output))
@@ -304,6 +333,7 @@ def main():
               'ocr_metric_scope':'all_samples_ocr separately reports every decoded sample, including CTC-ineligible cases',
               'writer':'accuracy over known training writers only; null if no eligible writers'}
     metadata['coordinate_errors']='Same-index absolute XY errors, no alignment/rescaling; X bins use absolute GT X; text thirds use character endpoints; pooled MAE weighted by points'
+    if output_bounds is not None:metadata['output_bounds']=output_bounds
     (out/'report.json').write_text(json.dumps({'summary':summary,'evaluation':metadata,'coordinate_errors_by_writer':writer_coordinates,'samples':rows},ensure_ascii=False,indent=2))
     page.insert(1,'<h2>Summary</h2><pre>'+html.escape(json.dumps(summary,ensure_ascii=False,indent=2))+'</pre>')
     (out/'index.html').write_text('\n'.join(page))
