@@ -18,7 +18,7 @@ from utils.utils import ModelConfig
 from utils.mask import downsample_mask
 
 
-def diagnose_output_bounds(model):
+def diagnose_output_bounds(model, coordinate_multiplier=1.0):
     """Cauchy-Schwarz bounds for the final post-LayerNorm linear head."""
     head=model.transformer_decoder
     layer=head.transformer.layers[-1]
@@ -35,11 +35,14 @@ def diagnose_output_bounds(model):
         effective=effective-effective.mean(dim=1,keepdim=True)
         radius=weight.shape[1]**.5*effective.norm(dim=1)
         return {'status':'valid outer bounds for current weights, not a fixed architecture limit',
+                'coordinate_multiplier':coordinate_multiplier,
                 'x_components':[{'component':i,'lower':float(center[23+i]-radius[23+i]),
-                                 'upper':float(center[23+i]+radius[23+i])} for i in range(20)]}
+                                 'upper':float(center[23+i]+radius[23+i]),
+                                 'lower_original_units':float((center[23+i]-radius[23+i])/coordinate_multiplier),
+                                 'upper_original_units':float((center[23+i]+radius[23+i])/coordinate_multiplier)} for i in range(20)]}
 
 
-def diagnose_gmm(output, seq):
+def diagnose_gmm(output, seq, coordinate_multiplier=1.0):
     """Compare the original PDF-floor loss gradient with log-space NLL at fixed outputs."""
     with torch.inference_mode(False), torch.enable_grad():
         raw=output.detach().clone().requires_grad_(True)
@@ -55,12 +58,18 @@ def diagnose_gmm(output, seq):
         old=-torch.log(density+1e-8)
         old_grad=torch.autograd.grad(old.sum(),raw,retain_graph=True)[0][:,23:63,:n].abs().sum(1)[0]
         stable_grad=torch.autograd.grad((-log_density).sum(),raw)[0][:,23:63,:n].abs().sum(1)[0]
-        far=target[0,0].abs()>34
+        far=(target[0,0]/coordinate_multiplier).abs()>34
         chosen=pi.argmax(dim=1,keepdim=True)
         chosen_sx=sx.gather(1,chosen)[0,0]
         chosen_sy=sy.gather(1,chosen)[0,0]
         result={'gt_x_min':float(target[0,0].min()),'gt_x_max':float(target[0,0].max()),
                 'all_component_x_min':float(mx.min()),'all_component_x_max':float(mx.max()),
+                'coordinate_multiplier':coordinate_multiplier,
+                'region_units':'original normalized coordinates; split at abs(GT x) = 34',
+                'gt_x_min_original_units':float(target[0,0].min()/coordinate_multiplier),
+                'gt_x_max_original_units':float(target[0,0].max()/coordinate_multiplier),
+                'all_component_x_min_original_units':float(mx.min()/coordinate_multiplier),
+                'all_component_x_max_original_units':float(mx.max()/coordinate_multiplier),
                 'scope':'mu reconstruction; gradients w.r.t. all component XY means; per-point NLL, no parameter updates'}
         for label,selected in [('all',torch.ones_like(far)),('abs_gt_x_gt_34',far),('abs_gt_x_le_34',~far)]:
             count=int(selected.sum());entry={'points':count}
@@ -72,6 +81,7 @@ def diagnose_gmm(output, seq):
                              logspace_xy_gradient_mean=float(stable_grad[selected].mean()),
                              selected_sigma_x_mean=float(chosen_sx[selected].mean()),
                              selected_sigma_y_mean=float(chosen_sy[selected].mean()),
+                             selected_sigma_x_mean_original_units=float(chosen_sx[selected].mean()/coordinate_multiplier),
                              mixture_weighted_sigma_x_mean=float((pi*sx).sum(1)[0,selected].mean()))
             result[label]=entry
         return result
@@ -243,7 +253,7 @@ def main():
     style_available=available('style_classifier.') and len(writer_ids)==config['num_writer']
     model.load_state_dict({key:value for key,value in weights.items() if key in state and state[key].shape==value.shape},strict=False)
     model=model.to(args.device).eval()
-    output_bounds=diagnose_output_bounds(model) if args.diagnose_gmm else None
+    output_bounds=diagnose_output_bounds(model,float(ckpt.get('config',{}).get('coordinate_multiplier',1.0))) if args.diagnose_gmm else None
     if output_bounds is not None:print(json.dumps({'output_bounds':output_bounds}),flush=True)
     data_file=args.input or Path(config['val_file'])
     args.output.mkdir(parents=True,exist_ok=True)
@@ -279,7 +289,7 @@ def main():
             z,mu,_=model.encode(x)
             mu_output=model.decode(mu)
             if args.diagnose_gmm:
-                info['gmm_diagnostics']=diagnose_gmm(mu_output,seq)
+                info['gmm_diagnostics']=diagnose_gmm(mu_output,seq,coordinate_multiplier)
                 print(json.dumps({'key':key,'gmm_diagnostics':info['gmm_diagnostics']}),flush=True)
             curves={'gt':seq,'mu_argmax':decode_argmax(mu_output,n)}
             info['text_evaluation']=None
