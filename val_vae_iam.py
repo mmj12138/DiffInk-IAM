@@ -42,7 +42,7 @@ def diagnose_output_bounds(model, coordinate_multiplier=1.0):
                                  'upper_original_units':float((center[23+i]+radius[23+i])/coordinate_multiplier)} for i in range(20)]}
 
 
-def diagnose_gmm(output, seq, coordinate_multiplier=1.0):
+def diagnose_gmm(output, seq, coordinate_multiplier=1.0, output_bounds=None):
     """Compare the original PDF-floor loss gradient with log-space NLL at fixed outputs."""
     with torch.inference_mode(False), torch.enable_grad():
         raw=output.detach().clone().requires_grad_(True)
@@ -62,6 +62,23 @@ def diagnose_gmm(output, seq, coordinate_multiplier=1.0):
         chosen=pi.argmax(dim=1,keepdim=True)
         chosen_sx=sx.gather(1,chosen)[0,0]
         chosen_sy=sy.gather(1,chosen)[0,0]
+        # Oracle uses GT only for diagnosis; it is not a generation method.
+        distances=((mx-target[:,0:1]).square()+(my-target[:,1:2]).square()).sqrt()/coordinate_multiplier
+        oracle=distances.argmin(dim=1,keepdim=True)
+        chosen_distance=distances.gather(1,chosen)[0,0]
+        oracle_distance=distances.gather(1,oracle)[0,0]
+        chosen_x=mx.gather(1,chosen)[0,0]
+        oracle_x=mx.gather(1,oracle)[0,0]
+        near_bound=None
+        unreachable=None
+        if output_bounds and 'x_components' in output_bounds:
+            lower=torch.tensor([v['lower'] for v in output_bounds['x_components']],device=raw.device)
+            upper=torch.tensor([v['upper'] for v in output_bounds['x_components']],device=raw.device)
+            index=chosen[0,0]
+            chosen_lower=lower[index];chosen_upper=upper[index]
+            margin=torch.minimum(chosen_x-chosen_lower,chosen_upper-chosen_x)
+            near_bound=margin<=.05*(chosen_upper-chosen_lower)
+            unreachable=(target[0,0]<chosen_lower)|(target[0,0]>chosen_upper)
         result={'gt_x_min':float(target[0,0].min()),'gt_x_max':float(target[0,0].max()),
                 'all_component_x_min':float(mx.min()),'all_component_x_max':float(mx.max()),
                 'coordinate_multiplier':coordinate_multiplier,
@@ -83,6 +100,17 @@ def diagnose_gmm(output, seq, coordinate_multiplier=1.0):
                              selected_sigma_y_mean=float(chosen_sy[selected].mean()),
                              selected_sigma_x_mean_original_units=float(chosen_sx[selected].mean()/coordinate_multiplier),
                              mixture_weighted_sigma_x_mean=float((pi*sx).sum(1)[0,selected].mean()))
+                entry.update(selected_component_counts=torch.bincount(chosen[0,0,selected],minlength=20).tolist(),
+                             oracle_component_counts=torch.bincount(oracle[0,0,selected],minlength=20).tolist(),
+                             selected_point_distance_mean_original_units=float(chosen_distance[selected].mean()),
+                             oracle_point_distance_mean_original_units=float(oracle_distance[selected].mean()),
+                             selected_x_mae_original_units=float(((chosen_x-target[0,0]).abs()/coordinate_multiplier)[selected].mean()),
+                             oracle_x_mae_original_units=float(((oracle_x-target[0,0]).abs()/coordinate_multiplier)[selected].mean()),
+                             oracle_component_probability_mean=float(pi.gather(1,oracle)[0,0,selected].mean()),
+                             selected_vs_oracle_different_fraction=float((chosen[0,0,selected]!=oracle[0,0,selected]).float().mean()))
+                if near_bound is not None:
+                    entry['selected_mean_near_own_bound_fraction']=float(near_bound[selected].float().mean())
+                    entry['gt_outside_selected_component_bound_fraction']=float(unreachable[selected].float().mean())
             result[label]=entry
         return result
 
@@ -289,7 +317,7 @@ def main():
             z,mu,_=model.encode(x)
             mu_output=model.decode(mu)
             if args.diagnose_gmm:
-                info['gmm_diagnostics']=diagnose_gmm(mu_output,seq,coordinate_multiplier)
+                info['gmm_diagnostics']=diagnose_gmm(mu_output,seq,coordinate_multiplier,output_bounds)
                 print(json.dumps({'key':key,'gmm_diagnostics':info['gmm_diagnostics']}),flush=True)
             curves={'gt':seq,'mu_argmax':decode_argmax(mu_output,n)}
             info['text_evaluation']=None
